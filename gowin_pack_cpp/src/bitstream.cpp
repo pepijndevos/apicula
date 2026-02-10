@@ -785,6 +785,7 @@ Bitstream generate_bitstream(Device& db, const Netlist& netlist, const PackArgs&
     // -----------------------------------------------------------------------
     // Step 5: Place cells (including pass-through LUTs from routing)
     // -----------------------------------------------------------------------
+    clear_bsram_init_map();
     place_cells(db, netlist, tilemap, device, pip_bels);
 
     // -----------------------------------------------------------------------
@@ -829,9 +830,18 @@ Bitstream generate_bitstream(Device& db, const Netlist& netlist, const PackArgs&
 
     // -----------------------------------------------------------------------
     // Step 10: Compute checksum and set in footer
+    // Python computes checksum BEFORE appending BSRAM init data.
     // -----------------------------------------------------------------------
     uint16_t checksum = compute_checksum(main_map);
     set_footer_checksum(bs.footer, checksum, device);
+
+    // -----------------------------------------------------------------------
+    // Step 10b: Append BSRAM init data (vstack) AFTER checksum
+    // -----------------------------------------------------------------------
+    const auto& bsram_init = get_bsram_init_map();
+    if (!bsram_init.empty()) {
+        main_map.insert(main_map.end(), bsram_init.begin(), bsram_init.end());
+    }
 
     // -----------------------------------------------------------------------
     // Step 11: Update frame count in header

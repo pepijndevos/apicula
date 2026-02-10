@@ -3,6 +3,7 @@
 #include "place.hpp"
 #include "fuses.hpp"
 #include "attrids.hpp"
+#include "bels/dsp.hpp"
 #include <regex>
 #include <iostream>
 #include <cmath>
@@ -99,9 +100,58 @@ static std::map<std::tuple<int64_t, int64_t, int64_t>, std::map<std::string, std
 // ============================================================================
 // get_bels - Extract BELs from netlist
 // ============================================================================
+// Cell type sets for extra BEL generation
+static const std::set<std::string> _bsram_cell_types = {"DP", "SDP", "SP", "ROM"};
+static const std::set<std::string> _dsp_cell_types = {
+    "ALU54D", "MULT36X36", "MULTALU36X18", "MULTADDALU18X18",
+    "MULTALU18X18", "MULT18X18", "MULT9X9", "PADD18", "PADD9"};
+static const std::set<std::string> _clkdiv_cell_types = {"CLKDIV", "CLKDIV2"};
+
+// Helper to sanitize verilog names (matching Python sanitize_name)
+static std::string sanitize_name(const std::string& name) {
+    std::string retname = name;
+    if (retname.size() >= 3 && retname.substr(retname.size()-3) == "_LC") {
+        retname = retname.substr(0, retname.size()-3);
+    } else if (retname.size() >= 6 && retname.substr(retname.size()-6) == "_DFFLC") {
+        retname = retname.substr(0, retname.size()-6);
+    } else if (retname.size() >= 4 && retname.substr(retname.size()-4) == "$iob") {
+        retname = retname.substr(0, retname.size()-4);
+    }
+    static std::regex verilog_name_re(R"(^[A-Za-z_0-9][A-Za-z_0-9$]*$)");
+    if (std::regex_match(retname, verilog_name_re)) {
+        return retname;
+    }
+    return "\\" + retname + " ";
+}
+
+// Helper to create an extra BEL from a cell
+static BelInfo make_extra_bel(const Cell& cell, const std::string& type,
+                               int64_t row, int64_t col, const std::string& num,
+                               const std::string& name) {
+    BelInfo bel;
+    bel.type = type;
+    bel.row = row;
+    bel.col = col;
+    bel.num = num;
+    bel.name = name;
+    bel.cell = &cell;
+    for (const auto& [k, v] : cell.parameters) {
+        if (auto* s = std::get_if<std::string>(&v)) bel.parameters[k] = *s;
+        else if (auto* i = std::get_if<int64_t>(&v)) bel.parameters[k] = std::to_string(*i);
+    }
+    for (const auto& [k, v] : cell.attributes) {
+        if (auto* s = std::get_if<std::string>(&v)) bel.attributes[k] = *s;
+        else if (auto* i = std::get_if<int64_t>(&v)) bel.attributes[k] = std::to_string(*i);
+    }
+    return bel;
+}
+
 std::vector<BelInfo> get_bels(const Netlist& netlist) {
     std::vector<BelInfo> bels;
-    std::regex bel_re(R"(X(\d+)Y(\d+)/(?:GSR|LUT|DFF|IOB|MUX|ALU|ODDR|OSC[ZFHWOA]?|BUF[GS]|RAM16SDP4|RAM16SDP2|RAM16SDP1|PLL[A]?|IOLOGIC|CLKDIV2?|BSRAM|DSP|MULT\w+|PADD\d+|BANDGAP|DQCE|DCS|USERFLASH|EMCU|DHCEN|MIPI_[IO]BUF|DLLDLY|PINCFG|ADC)(\w*))");
+    // Deferred differential buffer BELs (processed last)
+    std::vector<std::tuple<std::string, const Cell*, int64_t, int64_t, std::string>> later;
+
+    std::regex bel_re(R"(X(\d+)Y(\d+)/(?:GSR|LUT|DFF|IOB|MUX|ALU|ODDR|OSC[ZFHWOA]?|BUF[GS]|RAM16SDP4|RAM16SDP2|RAM16SDP1|PLL[A]?|IOLOGIC|CLKDIV2?|BSRAM|ALU|MULTALU18X18|MULTALU36X18|MULTADDALU18X18|MULT36X36|MULT18X18|MULT9X9|PADD18|PADD9|BANDGAP|DQCE|DCS|USERFLASH|EMCU|DHCEN|MIPI_[IO]BUF|DLLDLY|PINCFG|ADC)(\w*))");
 
     for (const auto& [cellname, cell] : netlist.cells) {
         // Skip dummy cells and cells without BEL attribute
@@ -128,13 +178,54 @@ std::vector<BelInfo> get_bels(const Netlist& netlist) {
             continue;
         }
 
+        int64_t col = std::stoll(match[1].str()) + 1;
+        int64_t row = std::stoll(match[2].str()) + 1;
+        std::string num = match[3].str();
+        std::string cell_type = cell.type;
+
+        // Defer differential buffers to end of queue
+        if (cell.attributes.find("DIFF") != cell.attributes.end()) {
+            later.emplace_back(cellname, &cell, row, col, num);
+            continue;
+        }
+
+        // rPLL -> RPLLA type rename (extra PLL BELs handled elsewhere)
+        if (cell_type == "rPLL") {
+            cell_type = "RPLLA";
+        }
+
+        // Generate extra BSRAM BELs (2 adjacent tiles)
+        if (_bsram_cell_types.count(cell_type)) {
+            std::string sname = sanitize_name(cellname);
+            for (int off = 1; off <= 2; ++off) {
+                bels.push_back(make_extra_bel(cell, "BSRAM_AUX", row, col + off,
+                                               num, sname + "AUX" + std::to_string(off)));
+            }
+        }
+
+        // Generate extra DSP BELs (8 adjacent tiles)
+        if (_dsp_cell_types.count(cell_type)) {
+            std::string sname = sanitize_name(cellname);
+            for (int off = 1; off <= 8; ++off) {
+                bels.push_back(make_extra_bel(cell, "DSP_AUX", row, col + off,
+                                               num, sname + "AUX" + std::to_string(off)));
+            }
+        }
+
+        // Generate extra MIPI BELs
+        if (cell_type == "MIPI_IBUF") {
+            std::string sname = sanitize_name(cellname);
+            bels.push_back(make_extra_bel(cell, "MIPI_IBUF_AUX", row, col + 1,
+                                           num, sname + "AUX"));
+        }
+
         BelInfo bel;
-        bel.col = std::stoll(match[1].str()) + 1;
-        bel.row = std::stoll(match[2].str()) + 1;
-        bel.type = cell.type;
-        bel.num = match[3].str();
+        bel.col = col;
+        bel.row = row;
+        bel.type = cell_type;
+        bel.num = num;
         bel.name = cellname;
-        bel.cell = &cell;  // Store pointer to original cell
+        bel.cell = &cell;
 
         // Copy parameters and attributes
         for (const auto& [k, v] : cell.parameters) {
@@ -154,6 +245,27 @@ std::vector<BelInfo> get_bels(const Netlist& netlist) {
 
         bels.push_back(std::move(bel));
     }
+
+    // Process deferred differential buffer BELs
+    for (const auto& [cellname, cellptr, row, col, num] : later) {
+        BelInfo bel;
+        bel.col = col;
+        bel.row = row;
+        bel.type = cellptr->type;
+        bel.num = num;
+        bel.name = cellname;
+        bel.cell = cellptr;
+        for (const auto& [k, v] : cellptr->parameters) {
+            if (auto* s = std::get_if<std::string>(&v)) bel.parameters[k] = *s;
+            else if (auto* i = std::get_if<int64_t>(&v)) bel.parameters[k] = std::to_string(*i);
+        }
+        for (const auto& [k, v] : cellptr->attributes) {
+            if (auto* s = std::get_if<std::string>(&v)) bel.attributes[k] = *s;
+            else if (auto* i = std::get_if<int64_t>(&v)) bel.attributes[k] = std::to_string(*i);
+        }
+        bels.push_back(std::move(bel));
+    }
+
     return bels;
 }
 
@@ -185,11 +297,10 @@ void place_cells(
             place_iob(db, bel, tilemap, device);
         } else if (bel.type == "rPLL" || bel.type == "PLLVR" || bel.type == "PLLA" || bel.type == "RPLLA") {
             place_pll(db, bel, tilemap, device);
-        } else if (bel.type == "DP" || bel.type == "SDP" || bel.type == "SP" || bel.type == "ROM") {
+        } else if (bel.type == "DP" || bel.type == "SDP" || bel.type == "SP" || bel.type == "ROM" ||
+                   bel.type == "BSRAM_AUX") {
             place_bsram(db, bel, tilemap, device);
-        } else if (bel.type.find("MULT") != std::string::npos ||
-                   bel.type.find("ALU54") != std::string::npos ||
-                   bel.type.find("PADD") != std::string::npos) {
+        } else if (_dsp_cell_types.count(bel.type) || bel.type == "DSP_AUX") {
             place_dsp(db, bel, tilemap, device);
         } else if (bel.type == "IOLOGIC" || bel.type == "ODDR" || bel.type == "IDDR" ||
                    bel.type == "ODDRC" || bel.type == "IDDRC" ||
@@ -217,6 +328,8 @@ void place_cells(
             place_dqce(db, bel, tilemap);
         } else if (bel.type == "DHCEN") {
             place_dhcen(db, bel, tilemap);
+        } else if (bel.type == "DLLDLY") {
+            place_dlldly(db, bel, tilemap, device);
         } else if (bel.type == "GSR" ||
                    bel.type == "BANDGAP" ||
                    bel.type == "PINCFG" ||
@@ -225,6 +338,7 @@ void place_cells(
                    bel.type.find("MUX2_") != std::string::npos ||
                    bel.type == "MIPI_OBUF" ||
                    bel.type == "MIPI_IBUF" ||
+                   bel.type == "MIPI_IBUF_AUX" ||
                    bel.type.find("BUFG") != std::string::npos) {
             // No-op types - skip
             continue;
@@ -1557,9 +1671,196 @@ static const std::map<int64_t, std::string> bsram_bit_widths = {
 // place_bsram - Place a BSRAM BEL
 // Uses shortval table "BSRAM_{typ}"
 // ============================================================================
+// Global BSRAM init map - populated during placement, used during bitstream generation
+static std::vector<std::vector<uint8_t>> bsram_init_map;
+
+const std::vector<std::vector<uint8_t>>& get_bsram_init_map() {
+    return bsram_init_map;
+}
+
+void clear_bsram_init_map() {
+    bsram_init_map.clear();
+}
+
+void store_bsram_init_val(Device& db, int64_t row, int64_t col,
+                           const std::string& typ,
+                           const std::map<std::string, std::string>& parms,
+                           std::map<std::string, std::string>& attrs,
+                           const std::string& device) {
+    if (parms.find("INIT_RAM_00") == parms.end()) return;
+
+    // Uppercase attrs
+    for (auto& [k, v] : attrs) {
+        for (auto& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    std::string subtype;
+    auto st_it = attrs.find("BSRAM_SUBTYPE");
+    if (st_it != attrs.end()) subtype = st_it->second;
+
+    bool is_gw5a = (device == "GW5A-25A");
+    int64_t chip_width = db.width();
+
+    if (bsram_init_map.empty()) {
+        int64_t bsram_rows = static_cast<int64_t>(db.simplio_rows.size());
+        if (is_gw5a) {
+            bsram_init_map.assign(72 * bsram_rows, std::vector<uint8_t>(chip_width, 0));
+        } else {
+            bsram_init_map.assign(256 * bsram_rows, std::vector<uint8_t>(chip_width, 0));
+        }
+    }
+
+    int64_t loc_height = 256;
+    int64_t loc_width = is_gw5a ? 72 : 3 * 60;
+    std::vector<std::vector<uint8_t>> loc_map(loc_height, std::vector<uint8_t>(loc_width, 0));
+
+    int width = 256;
+    // Trim whitespace from subtype for comparison
+    std::string sub_trimmed = subtype;
+    while (!sub_trimmed.empty() && std::isspace(static_cast<unsigned char>(sub_trimmed.back())))
+        sub_trimmed.pop_back();
+    while (!sub_trimmed.empty() && std::isspace(static_cast<unsigned char>(sub_trimmed.front())))
+        sub_trimmed.erase(sub_trimmed.begin());
+
+    if (sub_trimmed.empty()) {
+        width = 256;
+    } else if (sub_trimmed == "X9") {
+        width = 288;
+    } else {
+        std::cerr << "Warning: Init for " << subtype << " is not supported" << std::endl;
+        return;
+    }
+
+    auto& rev_li = db.rev_logicinfo("BSRAM_INIT");
+
+    int addr = -1;
+    for (int init_row = 0; init_row < 0x40; ++init_row) {
+        char row_name_buf[32];
+        snprintf(row_name_buf, sizeof(row_name_buf), "INIT_RAM_%02X", init_row);
+        std::string row_name(row_name_buf);
+
+        auto init_it = parms.find(row_name);
+        if (init_it == parms.end()) {
+            addr += 0x100;
+            continue;
+        }
+        const std::string& init_data = init_it->second;
+
+        // get_bits generator logic
+        int bit_no = 0;
+        int ptr = -1;
+        while (ptr >= -width) {
+            if (bit_no == 8 || bit_no == 17) {
+                char bit_val;
+                if (width == 288) {
+                    int real_idx = static_cast<int>(init_data.size()) + ptr;
+                    bit_val = (real_idx >= 0 && real_idx < static_cast<int>(init_data.size()))
+                              ? init_data[real_idx] : '0';
+                    ptr -= 1;
+                } else {
+                    bit_val = '0';
+                }
+                // addr doesn't change (lambda x: x)
+                if (bit_val != '0') {
+                    int logic_line = bit_no * 4 + (addr >> 12);
+                    auto li_it = rev_li.find(logic_line);
+                    if (li_it != rev_li.end()) {
+                        int bit = static_cast<int>(li_it->second.first) - 1;
+                        int quad_key = addr & 0x30;
+                        int quad;
+                        switch (quad_key) {
+                            case 0x30: quad = 0xc0; break;
+                            case 0x20: quad = 0x40; break;
+                            case 0x10: quad = 0x80; break;
+                            default:   quad = 0x00; break;
+                        }
+                        int map_row = quad + ((addr >> 6) & 0x3f);
+                        if (map_row >= 0 && map_row < loc_height && bit >= 0 && bit < loc_width) {
+                            loc_map[map_row][bit] = 1;
+                        }
+                    }
+                }
+                bit_no = (bit_no + 1) % 18;
+            } else {
+                int real_idx = static_cast<int>(init_data.size()) + ptr;
+                char bit_val = (real_idx >= 0 && real_idx < static_cast<int>(init_data.size()))
+                              ? init_data[real_idx] : '0';
+                ptr -= 1;
+                addr = addr + 1; // lambda x: x + 1
+
+                if (bit_val != '0') {
+                    int logic_line = bit_no * 4 + (addr >> 12);
+                    auto li_it = rev_li.find(logic_line);
+                    if (li_it != rev_li.end()) {
+                        int bit = static_cast<int>(li_it->second.first) - 1;
+                        int quad_key = addr & 0x30;
+                        int quad;
+                        switch (quad_key) {
+                            case 0x30: quad = 0xc0; break;
+                            case 0x20: quad = 0x40; break;
+                            case 0x10: quad = 0x80; break;
+                            default:   quad = 0x00; break;
+                        }
+                        int map_row = quad + ((addr >> 6) & 0x3f);
+                        if (map_row >= 0 && map_row < loc_height && bit >= 0 && bit < loc_width) {
+                            loc_map[map_row][bit] = 1;
+                        }
+                    }
+                }
+                bit_no = (bit_no + 1) % 18;
+            }
+        }
+    }
+
+    // Transpose for GW5A
+    if (is_gw5a) {
+        // Transpose loc_map
+        std::vector<std::vector<uint8_t>> transposed(loc_width, std::vector<uint8_t>(loc_height, 0));
+        for (int r = 0; r < loc_height; ++r) {
+            for (int c = 0; c < loc_width; ++c) {
+                transposed[c][r] = loc_map[r][c];
+            }
+        }
+        loc_map = std::move(transposed);
+        std::swap(loc_height, loc_width);
+    }
+
+    // Find Y offset from simplio_rows
+    int64_t height = is_gw5a ? 72 : 256;
+    int64_t y = 0;
+    for (int64_t brow : db.simplio_rows) {
+        if (row == brow) break;
+        y += height;
+    }
+
+    // Find X offset
+    int64_t x = 0;
+    if (!is_gw5a) {
+        for (int64_t jdx = 0; jdx < col; ++jdx) {
+            x += db.get_tile(0, jdx).width;
+        }
+    }
+
+    // Flip loc_map upside down (flipud)
+    std::reverse(loc_map.begin(), loc_map.end());
+
+    // Copy loc_map into bsram_init_map
+    for (const auto& lrow : loc_map) {
+        if (y >= 0 && y < static_cast<int64_t>(bsram_init_map.size())) {
+            int64_t x0 = x;
+            for (uint8_t val : lrow) {
+                if (x0 >= 0 && x0 < static_cast<int64_t>(bsram_init_map[y].size())) {
+                    bsram_init_map[y][x0] = val;
+                }
+                x0++;
+            }
+        }
+        y++;
+    }
+}
+
 void place_bsram(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device) {
     using namespace attrids;
-    (void)device;
 
     int64_t row = bel.row - 1;
     int64_t col = bel.col - 1;
@@ -1572,7 +1873,20 @@ void place_bsram(const Device& db, const BelInfo& bel, Tilemap& tilemap, const s
     const auto& tiledata = db.get_tile(row, col);
     int64_t ttyp = tiledata.ttyp;
 
-    std::string typ = bel.type;  // DP, SDP, SP, ROM
+    // For BSRAM_AUX, get the original type from the cell
+    std::string typ = bel.type;
+    bool is_aux = (typ == "BSRAM_AUX");
+    if (is_aux && bel.cell) {
+        typ = bel.cell->type;
+    } else if (is_aux) {
+        return;  // No cell info, can't determine type
+    }
+
+    // Store init data only for non-AUX BSRAM cells
+    if (!is_aux && device != "GW5A-25A") {
+        auto attrs_copy = bel.attributes;
+        store_bsram_init_val(const_cast<Device&>(db), row, col, typ, bel.parameters, attrs_copy, device);
+    }
     std::map<std::string, std::string> bsram_attrs;
     bsram_attrs["MODE"] = "ENABLE";
     bsram_attrs["GSR"] = "DISABLE";
@@ -1867,7 +2181,6 @@ void place_bsram(const Device& db, const BelInfo& bel, Tilemap& tilemap, const s
 // Uses shortval table "DSP{mac}"
 // ============================================================================
 void place_dsp(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device) {
-    using namespace attrids;
     (void)device;
 
     int64_t row = bel.row - 1;
@@ -1884,98 +2197,57 @@ void place_dsp(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std
     std::string typ = bel.type;
     std::string num = bel.num;
 
-    // For compound types, the num format from nextpnr is different
-    // MULTADDALU18X18, MULTALU36X18, MULTALU18X18, ALU54D use num[-1]+num[-1]
-    if (typ == "MULTADDALU18X18" || typ == "MULTALU36X18" || typ == "MULTALU18X18" || typ == "ALU54D") {
+    // DSP_AUX: get the real type from the original cell
+    if (typ == "DSP_AUX" && bel.cell) {
+        typ = bel.cell->type;
+    }
+
+    // For compound types, num[-1]+num[-1]
+    if (typ == "MULTADDALU18X18" || typ == "MULTALU36X18" ||
+        typ == "MULTALU18X18" || typ == "ALU54D") {
         if (!num.empty()) {
             char last = num.back();
             num = std::string(1, last) + std::string(1, last);
         }
     }
 
-    // Parse mac and idx from num (format: "XY" where X=mac, Y=idx)
-    int mac = 0;
-    int idx = 0;
-    if (num.size() >= 2) {
-        mac = num[0] - '0';
-        idx = num[1] - '0';
-    } else if (num.size() == 1) {
-        mac = num[0] - '0';
-    }
-    int even_odd = idx & 1;
-    int pair_idx = idx / 2;
-
-    std::map<std::string, std::string> dsp_str_attrs;
-    std::map<std::string, int64_t> dsp_int_attrs;
-
-    // M9MODE_EN for PADD9 and MULT9X9
-    if (typ == "PADD9" || typ == "MULT9X9") {
-        dsp_str_attrs["M9MODE_EN"] = "ENABLE";
-    }
-
-    // For a generic DSP implementation, we process the cell's parameters
-    // and convert them to DSP attribute IDs
     auto params = bel.parameters;
+    auto attrs = bel.attributes;
 
-    // Process common DSP parameters
-    for (const auto& [parm, val] : params) {
-        std::string uparm = to_upper(parm);
-        // Many DSP params map directly to DSP attrids
-        if (dsp_attrids.find(uparm) != dsp_attrids.end()) {
-            // Check if value is a string attr or integer
-            auto sval_it = dsp_attrvals.find(to_upper(val));
-            if (sval_it != dsp_attrvals.end()) {
-                dsp_str_attrs[uparm] = to_upper(val);
-            } else {
-                // Try parsing as integer
-                try {
-                    int64_t ival = parse_binary(val);
-                    dsp_int_attrs[uparm] = ival;
-                } catch (...) {}
+    if (typ != "MULT36X36") {
+        // Normal DSP types
+        std::set<int64_t> dsp_attrs = dsp::set_dsp_attrs(db, typ, params, num, attrs);
+        std::set<Coord> dspbits;
+        // Table name is DSP{num[-2]} - second-to-last char of num
+        if (num.size() >= 2) {
+            std::string table_name = std::string("DSP") + num[num.size() - 2];
+            auto ttyp_sv = db.shortval.find(ttyp);
+            if (ttyp_sv != db.shortval.end() &&
+                ttyp_sv->second.find(table_name) != ttyp_sv->second.end()) {
+                dspbits = get_shortval_fuses(db, ttyp, dsp_attrs, table_name);
+            }
+        } else {
+            // num too short for DSP table lookup
+        }
+        auto& tile = tilemap[{row, col}];
+        set_fuses_in_tile(tile, dspbits);
+    } else {
+        // MULT36X36: two macro sets, one per mac
+        std::vector<std::set<int64_t>> dsp_attrs =
+            dsp::set_dsp_mult36x36_attrs(db, typ, params, attrs);
+        std::set<Coord> dspbits;
+        for (int mac = 0; mac < 2; mac++) {
+            std::string table_name = "DSP" + std::to_string(mac);
+            auto ttyp_sv = db.shortval.find(ttyp);
+            if (ttyp_sv != db.shortval.end() &&
+                ttyp_sv->second.find(table_name) != ttyp_sv->second.end()) {
+                auto bits = get_shortval_fuses(db, ttyp, dsp_attrs[mac], table_name);
+                dspbits.insert(bits.begin(), bits.end());
             }
         }
+        auto& tile = tilemap[{row, col}];
+        set_fuses_in_tile(tile, dspbits);
     }
-
-    // Also process attributes
-    for (const auto& [attr, val] : bel.attributes) {
-        std::string ua = to_upper(attr);
-        if (dsp_attrids.find(ua) != dsp_attrids.end()) {
-            auto sval_it = dsp_attrvals.find(to_upper(val));
-            if (sval_it != dsp_attrvals.end()) {
-                dsp_str_attrs[ua] = to_upper(val);
-            }
-        }
-    }
-
-    (void)even_odd;
-    (void)pair_idx;
-
-    // Build final attribute set
-    std::set<int64_t> fin_attrs;
-    for (const auto& [attr, val] : dsp_str_attrs) {
-        auto attr_it = dsp_attrids.find(attr);
-        if (attr_it == dsp_attrids.end()) continue;
-        auto val_it = dsp_attrvals.find(val);
-        if (val_it == dsp_attrvals.end()) continue;
-        add_attr_val(db, "DSP", fin_attrs, attr_it->second, val_it->second);
-    }
-    for (const auto& [attr, val] : dsp_int_attrs) {
-        auto attr_it = dsp_attrids.find(attr);
-        if (attr_it == dsp_attrids.end()) continue;
-        add_attr_val(db, "DSP", fin_attrs, attr_it->second, val);
-    }
-
-    // Get fuses - table name is "DSP{mac}" where mac is the second-to-last char of num
-    std::string table_name = "DSP" + std::to_string(mac);
-    auto ttyp_sv = db.shortval.find(ttyp);
-    std::set<Coord> fuses;
-    if (ttyp_sv != db.shortval.end() && ttyp_sv->second.find(table_name) != ttyp_sv->second.end()) {
-        fuses = get_shortval_fuses(db, ttyp, fin_attrs, table_name);
-    }
-
-    // Set fuses
-    auto& tile = tilemap[{row, col}];
-    set_fuses_in_tile(tile, fuses);
 }
 
 // ============================================================================
@@ -2477,6 +2749,18 @@ void place_clkdiv(const Device& db, const BelInfo& bel, Tilemap& tilemap) {
 // ============================================================================
 // place_dcs - Place a DCS BEL (Dynamic Clock Select)
 // ============================================================================
+// Spine-to-quadrant index mapping for DCS
+static const std::map<std::string, std::pair<std::string, std::string>> _dcs_spine2quadrant_idx = {
+    {"SPINE6",  {"1", "DCS6"}},
+    {"SPINE7",  {"1", "DCS7"}},
+    {"SPINE14", {"2", "DCS6"}},
+    {"SPINE15", {"2", "DCS7"}},
+    {"SPINE22", {"3", "DCS6"}},
+    {"SPINE23", {"3", "DCS7"}},
+    {"SPINE30", {"4", "DCS6"}},
+    {"SPINE31", {"4", "DCS7"}},
+};
+
 void place_dcs(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device) {
     using namespace attrids;
 
@@ -2496,9 +2780,54 @@ void place_dcs(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std
     const auto& tiledata = db.get_tile(row, col);
     int64_t ttyp = tiledata.ttyp;
 
-    // Build DCS attributes
+    // Look up the DCS spine from extra_func
+    auto ef_it = db.extra_func.find({row, col});
+    if (ef_it == db.extra_func.end()) return;
+
+    // Get the 'dcs' entry from extra_func
+    auto dcs_it = ef_it->second.find("dcs");
+    if (dcs_it == ef_it->second.end()) return;
+
+    // Get the clkout spine name for this DCS num
+    std::string spine;
+    int dcs_num = 0;
+    try { dcs_num = std::stoi(bel.num); } catch (...) {}
+
+    // Parse extra_func['dcs'][num]['clkout']
+    try {
+        auto& dcs_arr = const_cast<msgpack::object&>(dcs_it->second);
+        if (dcs_arr.type == msgpack::type::MAP) {
+            auto dcs_map = dcs_arr.as<std::map<int64_t, std::map<std::string, msgpack::object>>>();
+            auto num_it = dcs_map.find(dcs_num);
+            if (num_it != dcs_map.end()) {
+                auto co_it = num_it->second.find("clkout");
+                if (co_it != num_it->second.end()) {
+                    spine = co_it->second.as<std::string>();
+                }
+            }
+        }
+    } catch (...) {}
+
+    if (spine.empty()) return;
+
+    // Look up quadrant and table index from spine
+    auto sq_it = _dcs_spine2quadrant_idx.find(spine);
+    if (sq_it == _dcs_spine2quadrant_idx.end()) return;
+
+    const std::string& quadrant = sq_it->second.first;
+    const std::string& table_idx = sq_it->second.second;
+
+    // Build DCS attributes using the quadrant as the attribute key
+    auto attrs_copy = bel.attributes;
+    for (auto& [k, v] : attrs_copy) {
+        for (auto& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    std::map<std::string, std::string> dcs_dict;
+    dcs_dict[quadrant] = get_attr(attrs_copy, "DCS_MODE", "RISING");
+
     std::set<int64_t> dcs_attrs_set;
-    for (const auto& [attr, val] : bel.attributes) {
+    for (const auto& [attr, val] : dcs_dict) {
         auto attr_it = dcs_attrids.find(attr);
         if (attr_it == dcs_attrids.end()) continue;
         auto val_it = dcs_attrvals.find(val);
@@ -2506,15 +2835,96 @@ void place_dcs(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std
         add_attr_val(db, "DCS", dcs_attrs_set, attr_it->second, val_it->second);
     }
 
-    // For non-GW5A, use longfuses table
     if (device != "GW5A-25A") {
-        // The DCS table name depends on the spine quadrant
-        // For simplicity, try with the number-based table
-        std::string dcs_num = bel.num;
-        std::string table_name = db.dcs_prefix + dcs_num;
-        std::set<Coord> fuses = get_long_fuses(db, ttyp, dcs_attrs_set, table_name);
+        std::set<Coord> fuses = get_long_fuses(db, ttyp, dcs_attrs_set, table_idx);
         auto& tile = tilemap[{row, col}];
         set_fuses_in_tile(tile, fuses);
+    }
+}
+
+// ============================================================================
+// place_dlldly - Place a DLLDLY BEL
+// ============================================================================
+void place_dlldly(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device) {
+    using namespace attrids;
+    (void)device;
+
+    int64_t row = bel.row - 1;
+    int64_t col = bel.col - 1;
+
+    if (row < 0 || row >= static_cast<int64_t>(db.rows()) ||
+        col < 0 || col >= static_cast<int64_t>(db.cols())) {
+        return;
+    }
+
+    // Build DLLDLY attributes from parameters
+    auto params = bel.parameters;
+    // Uppercase all param values
+    for (auto& [k, v] : params) {
+        for (auto& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    std::map<std::string, std::string> dlldly_dict;
+    std::string dll_insel = "1";
+    auto it = params.find("DLL_INSEL");
+    if (it != params.end()) dll_insel = it->second;
+
+    std::string dly_sign = "0";
+    it = params.find("DLY_SIGN");
+    if (it != params.end()) dly_sign = it->second;
+
+    std::string dly_adj = "00000000000000000000000000000000";
+    it = params.find("DLY_ADJ");
+    if (it != params.end()) dly_adj = it->second;
+
+    // DLL_INSEL must be 1
+    dlldly_dict["ENABLED"] = "ENABLE";
+    dlldly_dict["MODE"] = "NORMAL";
+
+    if (dly_sign == "1") {
+        dlldly_dict["SIGN"] = "NEG";
+    }
+
+    // Process DLY_ADJ bits (reversed)
+    for (int i = 0; i < static_cast<int>(dly_adj.size()); ++i) {
+        int rev_idx = static_cast<int>(dly_adj.size()) - 1 - i;
+        if (dly_adj[rev_idx] == '1') {
+            dlldly_dict["ADJ" + std::to_string(i)] = "1";
+        }
+    }
+
+    // Convert to fin_attrs
+    std::set<int64_t> fin_attrs;
+    for (const auto& [attr, val] : dlldly_dict) {
+        auto attr_it = dlldly_attrids.find(attr);
+        if (attr_it == dlldly_attrids.end()) continue;
+        auto val_it = dlldly_attrvals.find(val);
+        if (val_it == dlldly_attrvals.end()) continue;
+        add_attr_val(db, "DLLDLY", fin_attrs, attr_it->second, val_it->second);
+    }
+
+    // Get fuse locations from extra_func 'dlldly_fusebels'
+    auto ef_it = db.extra_func.find({row, col});
+    if (ef_it == db.extra_func.end()) return;
+
+    auto fb_it = ef_it->second.find("dlldly_fusebels");
+    if (fb_it == ef_it->second.end()) return;
+
+    try {
+        auto fusebels = fb_it->second.as<std::vector<std::pair<int64_t, int64_t>>>();
+        for (const auto& [fb_row, fb_col] : fusebels) {
+            if (fb_row < 0 || fb_row >= static_cast<int64_t>(db.rows()) ||
+                fb_col < 0 || fb_col >= static_cast<int64_t>(db.cols())) {
+                continue;
+            }
+            const auto& fb_tiledata = db.get_tile(fb_row, fb_col);
+            auto& fb_tile = tilemap[{fb_row, fb_col}];
+            std::string table_name = "DLLDEL" + bel.num;
+            std::set<Coord> fuses = get_long_fuses(db, fb_tiledata.ttyp, fin_attrs, table_name);
+            set_fuses_in_tile(fb_tile, fuses);
+        }
+    } catch (...) {
+        // If parsing fails, try single tile approach
     }
 }
 

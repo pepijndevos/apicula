@@ -54,6 +54,7 @@ void place_clkdiv(const Device& db, const BelInfo& bel, Tilemap& tilemap);
 void place_dcs(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device);
 void place_dqce(const Device& db, const BelInfo& bel, Tilemap& tilemap);
 void place_dhcen(const Device& db, const BelInfo& bel, Tilemap& tilemap);
+void place_dlldly(const Device& db, const BelInfo& bel, Tilemap& tilemap, const std::string& device);
 
 // Set default IO fuses for all IOB pins (used and unused) and bank-level fuses
 void set_iob_default_fuses(
@@ -70,5 +71,11 @@ void set_fuses_in_tile(TileBitmap& tile, const std::set<Coord>& fuses);
 
 // Helper: clear fuses in a tile bitmap from a set of coordinates
 void clear_fuses_in_tile(TileBitmap& tile, const std::set<Coord>& fuses);
+
+// Get the accumulated BSRAM init map (populated during placement)
+const std::vector<std::vector<uint8_t>>& get_bsram_init_map();
+
+// Clear the BSRAM init map (call before placement)
+void clear_bsram_init_map();
 
 } // namespace apycula
