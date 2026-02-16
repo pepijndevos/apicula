@@ -729,6 +729,51 @@ def set_adc_attrs(db, idx, attrs):
         add_attr_val(db, 'ADC', fin_attrs, attrids.adc_attrids[attr], val)
     return fin_attrs
 
+# PLL parameter translation tables
+# Attrs that need int(val, 2) conversion, keeping the same output attr name
+_pll_int_bin_same_name = {
+    'A_IDIV_SEL', 'A_FBDIV_SEL',
+    'A_ODIV0_FRAC_SEL',
+    'A_ODIV0_SEL', 'A_ODIV1_SEL', 'A_ODIV2_SEL', 'A_ODIV3_SEL',
+    'A_ODIV4_SEL', 'A_ODIV5_SEL', 'A_ODIV6_SEL',
+    'A_MDIV_SEL', 'A_MDIV_FRAC_SEL',
+    'A_CLKOUT0_DT_DIR', 'A_CLKOUT1_DT_DIR', 'A_CLKOUT2_DT_DIR', 'A_CLKOUT3_DT_DIR',
+    'A_CLKOUT0_DT_STEP', 'A_CLKOUT1_DT_STEP', 'A_CLKOUT2_DT_STEP', 'A_CLKOUT3_DT_STEP',
+    'A_CLKIN0_SEL', 'A_CLKOUT0_SEL', 'A_CLKIN1_SEL', 'A_CLKOUT1_SEL',
+    'A_CLKIN2_SEL', 'A_CLKOUT2_SEL', 'A_CLKIN3_SEL', 'A_CLKOUT3_SEL',
+    'A_CLKIN4_SEL', 'A_CLKOUT4_SEL', 'A_CLKIN5_SEL', 'A_CLKOUT5_SEL',
+    'A_CLKIN6_SEL', 'A_CLKOUT6_SEL',
+    'A_CLKOUT0_PE_COARSE', 'A_CLKOUT0_PE_FINE',
+    'A_CLKOUT1_PE_COARSE', 'A_CLKOUT1_PE_FINE',
+    'A_CLKOUT2_PE_COARSE', 'A_CLKOUT2_PE_FINE',
+    'A_CLKOUT3_PE_COARSE', 'A_CLKOUT3_PE_FINE',
+    'A_CLKOUT4_PE_COARSE', 'A_CLKOUT4_PE_FINE',
+    'A_CLKOUT5_PE_COARSE', 'A_CLKOUT5_PE_FINE',
+    'A_CLKOUT6_PE_COARSE', 'A_CLKOUT6_PE_FINE',
+}
+
+# Attrs that need int(val, 2) + offset, with rename: input -> (output, offset)
+_pll_int_bin_rename = {
+    'IDIV_SEL':     ('IDIV', 1),
+    'FBDIV_SEL':    ('FDIV', 1),
+    'DYN_SDIV_SEL': ('SDIV', 0),
+    'ODIV_SEL':     ('ODIV', 0),
+}
+
+# Attrs where a specific input value triggers setting a different output attr:
+# input -> (trigger_val, output_attr, output_val)
+_pll_conditional_rename = {
+    'A_CLKFB_SEL':    ('INTERNAL', 'A_CLKFB_SEL', 'CLKFB2'),
+    'CLKOUTD_SRC':    ('CLKOUTP', 'CLKOUTDIVSEL', 'CLKOUTPS'),
+    'CLKOUTD3_SRC':   ('CLKOUTP', 'CLKOUTDIV3SEL', 'CLKOUTPS'),
+    'DYN_IDIV_SEL':   ('true', 'IDIVSEL', 'DYN'),
+    'DYN_FBDIV_SEL':  ('true', 'FDIVSEL', 'DYN'),
+    'DYN_ODIV_SEL':   ('true', 'ODIVSEL', 'DYN'),
+    'CLKOUT_BYPASS':  ('true', 'BYPCK', 'BYPASS'),
+    'CLKOUTP_BYPASS': ('true', 'BYPCKPS', 'BYPASS'),
+    'CLKOUTD_BYPASS': ('true', 'BYPCKDIV', 'BYPASS'),
+}
+
 # typ - PLL type (RPLL, etc)
 def set_pll_attrs(db, typ, idx, attrs):
     attrs_upper(attrs)
@@ -746,261 +791,32 @@ def set_pll_attrs(db, typ, idx, attrs):
         pll_attrs[['PLLVCC0', 'PLLVCC1'][idx]] = 'ENABLE'
 
     # parse attrs
+    fclkin = 100.0
     for attr, val in pll_inattrs.items():
         if attr in pll_attrs:
             pll_attrs[attr] = val
-        if attr.startswith('A_CLKOUT') and attr[-3:] == '_EN':
+        # PLLA prefix-pattern pass-throughs
+        if (attr.startswith('A_CLKOUT') and attr[-3:] == '_EN') or \
+           (attr.startswith('A_DYN_PE') and attr[-3:] == 'SEL') or \
+           (attr.startswith('A_DE') and attr[-3:] == '_EN'):
             pll_attrs[attr] = val
             continue
-        if attr.startswith('A_DYN_PE') and attr[-3:] == 'SEL':
-            pll_attrs[attr] = val
+        # table-driven: int(val, 2) with same output name
+        if attr in _pll_int_bin_same_name:
+            pll_attrs[attr] = int(val, 2)
             continue
-        if attr.startswith('A_DE') and attr[-3:] == '_EN':
-            pll_attrs[attr] = val
+        # table-driven: int(val, 2) with rename and optional offset
+        if attr in _pll_int_bin_rename:
+            target, offset = _pll_int_bin_rename[attr]
+            pll_attrs[target] = offset + int(val, 2)
             continue
-        if attr == 'A_CLKFB_SEL':
-            if val == 'INTERNAL':
-                pll_attrs[attr] = 'CLKFB2'
+        # table-driven: value-triggered conditional rename
+        if attr in _pll_conditional_rename:
+            trigger_val, target_attr, target_val = _pll_conditional_rename[attr]
+            if val == trigger_val:
+                pll_attrs[target_attr] = target_val
             continue
-        if attr == 'CLKOUTD_SRC':
-            if val == 'CLKOUTP':
-                pll_attrs['CLKOUTDIVSEL'] = 'CLKOUTPS'
-            continue
-        if attr == 'CLKOUTD3_SRC':
-            if val == 'CLKOUTP':
-                pll_attrs['CLKOUTDIV3SEL'] = 'CLKOUTPS'
-            continue
-        if attr == 'DYN_IDIV_SEL':
-            if val == 'true':
-                pll_attrs['IDIVSEL'] = 'DYN'
-            continue
-        if attr == 'DYN_FBDIV_SEL':
-            if val == 'true':
-                pll_attrs['FDIVSEL'] = 'DYN'
-            continue
-        if attr == 'DYN_ODIV_SEL':
-            if val == 'true':
-                pll_attrs['ODIVSEL'] = 'DYN'
-            continue
-        if attr == 'CLKOUT_BYPASS':
-            if val == 'true':
-                pll_attrs['BYPCK'] = 'BYPASS'
-            continue
-        if attr == 'CLKOUTP_BYPASS':
-            if val == 'true':
-                pll_attrs['BYPCKPS'] = 'BYPASS'
-            continue
-        if attr == 'CLKOUTD_BYPASS':
-            if val == 'true':
-                pll_attrs['BYPCKDIV'] = 'BYPASS'
-            continue
-        if attr == 'IDIV_SEL':
-            idiv = 1 + int(val, 2)
-            pll_attrs['IDIV'] = idiv
-            continue
-        if attr == 'A_IDIV_SEL':
-            idiv = int(val, 2)
-            pll_attrs['A_IDIV_SEL'] = idiv
-            continue
-        if attr == 'FBDIV_SEL':
-            fbdiv = 1 + int(val, 2)
-            pll_attrs['FDIV'] = fbdiv
-            continue
-        if attr == 'A_FBDIV_SEL':
-            fbdiv = int(val, 2)
-            pll_attrs['A_FBDIV_SEL'] = fbdiv
-            continue
-        if attr == 'DYN_SDIV_SEL':
-            pll_attrs['SDIV'] = int(val, 2)
-            continue
-        if attr == 'ODIV_SEL':
-            odiv = int(val, 2)
-            pll_attrs['ODIV'] = odiv
-            continue
-        if attr == 'A_ODIV0_FRAC_SEL':
-            odiv_frac = int(val, 2)
-            pll_attrs['A_ODIV0_FRAC_SEL'] = odiv_frac
-            continue
-        if attr == 'A_ODIV0_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV0_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV1_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV1_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV2_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV2_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV3_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV3_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV4_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV4_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV5_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV5_SEL'] = odiv
-            continue
-        if attr == 'A_ODIV6_SEL':
-            odiv = int(val, 2)
-            pll_attrs['A_ODIV6_SEL'] = odiv
-            continue
-        if attr == 'A_MDIV_SEL':
-            mdiv = int(val, 2)
-            pll_attrs['A_MDIV_SEL'] = mdiv
-            continue
-        if attr == 'A_MDIV_FRAC_SEL':
-            mdiv_frac_sel = int(val, 2)
-            pll_attrs['A_MDIV_FRAC_SEL'] = mdiv_frac_sel
-            continue
-        if attr == 'A_CLKOUT0_DT_DIR':
-            dt_dir = int(val, 2)
-            pll_attrs['A_CLKOUT0_DT_DIR'] = dt_dir
-            continue
-        if attr == 'A_CLKOUT1_DT_DIR':
-            dt_dir = int(val, 2)
-            pll_attrs['A_CLKOUT1_DT_DIR'] = dt_dir
-            continue
-        if attr == 'A_CLKOUT2_DT_DIR':
-            dt_dir = int(val, 2)
-            pll_attrs['A_CLKOUT2_DT_DIR'] = dt_dir
-            continue
-        if attr == 'A_CLKOUT3_DT_DIR':
-            dt_dir = int(val, 2)
-            pll_attrs['A_CLKOUT3_DT_DIR'] = dt_dir
-            continue
-        if attr == 'A_CLKOUT0_DT_STEP':
-            dt_step = int(val, 2)
-            pll_attrs['A_CLKOUT0_DT_STEP'] = dt_step
-            continue
-        if attr == 'A_CLKOUT1_DT_STEP':
-            dt_step = int(val, 2)
-            pll_attrs['A_CLKOUT1_DT_STEP'] = dt_step
-            continue
-        if attr == 'A_CLKOUT2_DT_STEP':
-            dt_step = int(val, 2)
-            pll_attrs['A_CLKOUT2_DT_STEP'] = dt_step
-            continue
-        if attr == 'A_CLKOUT3_DT_STEP':
-            dt_step = int(val, 2)
-            pll_attrs['A_CLKOUT3_DT_STEP'] = dt_step
-            continue
-        if attr == 'A_CLKIN0_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN0_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT0_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT0_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN1_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN1_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT1_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT1_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN2_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN2_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT2_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT2_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN3_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN3_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT3_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT3_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN4_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN4_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT4_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT4_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN5_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN5_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT5_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT5_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKIN6_SEL':
-            a_clkin_sel= int(val, 2)
-            pll_attrs['A_CLKIN6_SEL'] = a_clkin_sel
-            continue
-        if attr == 'A_CLKOUT6_SEL':
-            a_clkout_sel= int(val, 2)
-            pll_attrs['A_CLKOUT6_SEL'] = a_clkout_sel
-            continue
-        if attr == 'A_CLKOUT0_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT0_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT0_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT0_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT1_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT1_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT1_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT1_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT2_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT2_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT2_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT2_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT3_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT3_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT3_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT3_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT4_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT4_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT4_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT4_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT5_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT5_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT5_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT5_PE_FINE'] = pe_fine
-            continue
-        if attr == 'A_CLKOUT6_PE_COARSE':
-            pe_coarse = int(val, 2)
-            pll_attrs['A_CLKOUT6_PE_COARSE'] = pe_coarse
-            continue
-        if attr == 'A_CLKOUT6_PE_FINE':
-            pe_fine = int(val, 2)
-            pll_attrs['A_CLKOUT6_PE_FINE'] = pe_fine
-            continue
+        # complex cases that remain as code
         if attr == 'DYN_DA_EN':
             if val == 'true':
                 pll_attrs['DPSEL'] = 'DYN'
@@ -1036,6 +852,16 @@ def set_pll_attrs(db, typ, idx, attrs):
                 print(f"The {fclkin}MHz frequency is outside the permissible range of 3-{_permitted_freqs[device][0]}MHz.")
                 fclkin = 100.0
             continue
+
+    # extract computed values for post-loop pump calculation
+    if typ == 'PLLA':
+        idiv = pll_attrs.get('A_IDIV_SEL', 1)
+        fbdiv = pll_attrs.get('A_FBDIV_SEL', 1)
+        mdiv = pll_attrs.get('A_MDIV_SEL', 8)
+    else:
+        idiv = pll_attrs.get('IDIV', 1)
+        fbdiv = pll_attrs.get('FDIV', 1)
+        odiv = pll_attrs.get('ODIV', 8)
 
     # static vs dynamic
     if device in {'GW5A-25A'}:
